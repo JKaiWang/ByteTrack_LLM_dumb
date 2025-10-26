@@ -139,7 +139,7 @@ docs/api
 events.out.tfevents*
 pretrained
 YOLOX_outputs/*
-output/*
+outputs/*
 video/*
 pretrained/*
 
