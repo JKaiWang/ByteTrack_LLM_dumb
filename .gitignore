@@ -141,4 +141,5 @@ pretrained
 YOLOX_outputs/*
 output/*
 video/*
+pretrained/*
 
