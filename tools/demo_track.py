@@ -5,6 +5,19 @@ import time
 import cv2
 import torch
 import re
+import json
+import shutil
+import subprocess
+import sys
+
+# --- Ensure project root on sys.path ---
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# --- Make stdout UTF-8 to avoid mojibake on Windows terminals ---
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass  # Py < 3.7 or environments that don't support reconfigure
 
 from loguru import logger
 
@@ -20,76 +33,44 @@ IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
 
 def make_parser():
-    parser = argparse.ArgumentParser("ByteTrack Demo!")
-    parser.add_argument(
-        "demo", default="image", help="demo type, eg. image, video and webcam"
-    )
+    parser = argparse.ArgumentParser("ByteTrack Demo")
+    parser.add_argument("demo", default="image", help="demo type: image | video | webcam")
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
 
-    parser.add_argument(
-        #"--path", default="./datasets/mot/train/MOT17-05-FRCNN/img1", help="path to images or video"
-        "--path", default="./videos/palace.mp4", help="path to images or video"
-    )
-    parser.add_argument("--camid", type=int, default=0, help="webcam demo camera id")
-    parser.add_argument(
-        "--save_result",
-        action="store_true",
-        help="whether to save the inference result of image/video",
-    )
+    # Path to images or video
+    parser.add_argument("--path", default="./videos/palace.mp4", help="path to images or video")
+    parser.add_argument("--camid", type=int, default=0, help="webcam camera id")
 
-    # exp file
-    parser.add_argument(
-        "-f",
-        "--exp_file",
-        default=None,
-        type=str,
-        help="pls input your expriment description file",
-    )
-    parser.add_argument("-c", "--ckpt", default=None, type=str, help="ckpt for eval")
-    parser.add_argument(
-        "--device",
-        default="gpu",
-        type=str,
-        help="device to run our model, can either be cpu or gpu",
-    )
-    parser.add_argument("--conf", default=None, type=float, help="test conf")
+    parser.add_argument("--save_result", action="store_true", help="save visualization results")
+
+    # Exp / ckpt / device
+    parser.add_argument("-f", "--exp_file", default=None, type=str, help="experiment description file")
+    parser.add_argument("-c", "--ckpt", default=None, type=str, help="checkpoint for eval")
+    parser.add_argument("--device", default="gpu", type=str, help="cpu | gpu")
+    parser.add_argument("--conf", default=None, type=float, help="test confidence threshold")
     parser.add_argument("--nms", default=None, type=float, help="test nms threshold")
-    parser.add_argument("--tsize", default=None, type=int, help="test img size")
-    parser.add_argument("--fps", default=30, type=int, help="frame rate (fps)")
-    parser.add_argument(
-        "--fp16",
-        dest="fp16",
-        default=False,
-        action="store_true",
-        help="Adopting mix precision evaluating.",
-    )
-    parser.add_argument(
-        "--fuse",
-        dest="fuse",
-        default=False,
-        action="store_true",
-        help="Fuse conv and bn for testing.",
-    )
-    parser.add_argument(
-        "--trt",
-        dest="trt",
-        default=False,
-        action="store_true",
-        help="Using TensorRT model for testing.",
-    )
-    # tracking args
+    parser.add_argument("--tsize", default=None, type=int, help="test image size (square)")
+    parser.add_argument("--fps", default=30, type=int, help="fallback FPS if video metadata missing")
+
+    # Inference toggles
+    parser.add_argument("--fp16", dest="fp16", default=False, action="store_true", help="mixed precision")
+    parser.add_argument("--fuse", dest="fuse", default=False, action="store_true", help="fuse conv+bn")
+    parser.add_argument("--trt", dest="trt", default=False, action="store_true", help="use TensorRT")
+
+    # Tracking args
     parser.add_argument("--track_thresh", type=float, default=0.5, help="tracking confidence threshold")
-    parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
-    parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold for tracking")
-    parser.add_argument(
-        "--aspect_ratio_thresh", type=float, default=1.6,
-        help="threshold for filtering out boxes of which aspect ratio are above the given value."
-    )
-    parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
-    parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
-    parser.add_argument("--target_id", type=int, default=-1,help="only keep this track id; -1 to keep all")
-    parser.add_argument("--prompt", type=str, default="找出穿粉紅色衣服的人", help="Prompt 給 LLM")
+    parser.add_argument("--track_buffer", type=int, default=30, help="frames to keep lost tracks")
+    parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold")
+    parser.add_argument("--aspect_ratio_thresh", type=float, default=1.6, help="filter overly tall boxes")
+    parser.add_argument("--min_box_area", type=float, default=10, help="filter tiny boxes")
+    parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="MOT20 mode")
+
+    # LLM target selection
+    parser.add_argument("--target_id", type=int, default=-1, help="keep only this track id; -1 = keep all")
+    parser.add_argument("--prompt", type=str, default="track person with pink", help="prompt for the LLM")
+
+    # Optional: explicit ffmpeg binary path via env var FFMPEG_BIN
     return parser
 
 
@@ -98,7 +79,7 @@ def get_image_list(path):
     for maindir, subdir, file_name_list in os.walk(path):
         for filename in file_name_list:
             apath = osp.join(maindir, filename)
-            ext = osp.splitext(apath)[1]
+            ext = osp.splitext(apath)[1].lower()
             if ext in IMAGE_EXT:
                 image_names.append(apath)
     return image_names
@@ -106,27 +87,22 @@ def get_image_list(path):
 
 def write_results(filename, results):
     save_format = '{frame},{id},{x1},{y1},{w},{h},{s},-1,-1,-1\n'
-    with open(filename, 'w') as f:
+    with open(filename, 'w', encoding='utf-8') as f:
         for frame_id, tlwhs, track_ids, scores in results:
             for tlwh, track_id, score in zip(tlwhs, track_ids, scores):
                 if track_id < 0:
                     continue
                 x1, y1, w, h = tlwh
-                line = save_format.format(frame=frame_id, id=track_id, x1=round(x1, 1), y1=round(y1, 1), w=round(w, 1), h=round(h, 1), s=round(score, 2))
+                line = save_format.format(
+                    frame=frame_id, id=track_id, x1=round(x1, 1), y1=round(y1, 1),
+                    w=round(w, 1), h=round(h, 1), s=round(score, 2)
+                )
                 f.write(line)
-    logger.info('save results to {}'.format(filename))
+    logger.info(f"save results to {filename}")
 
 
 class Predictor(object):
-    def __init__(
-        self,
-        model,
-        exp,
-        trt_file=None,
-        decoder=None,
-        device=torch.device("cpu"),
-        fp16=False
-    ):
+    def __init__(self, model, exp, trt_file=None, decoder=None, device=torch.device("cpu"), fp16=False):
         self.model = model
         self.decoder = decoder
         self.num_classes = exp.num_classes
@@ -137,10 +113,8 @@ class Predictor(object):
         self.fp16 = fp16
         if trt_file is not None:
             from torch2trt import TRTModule
-
             model_trt = TRTModule()
             model_trt.load_state_dict(torch.load(trt_file))
-
             x = torch.ones((1, 3, exp.test_size[0], exp.test_size[1]), device=device)
             self.model(x)
             self.model = model_trt
@@ -164,17 +138,14 @@ class Predictor(object):
         img_info["ratio"] = ratio
         img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
         if self.fp16:
-            img = img.half()  # to FP16
+            img = img.half()  # FP16
 
         with torch.no_grad():
             timer.tic()
             outputs = self.model(img)
             if self.decoder is not None:
                 outputs = self.decoder(outputs, dtype=outputs.type())
-            outputs = postprocess(
-                outputs, self.num_classes, self.confthre, self.nmsthre
-            )
-            #logger.info("Infer time: {:.4f}s".format(time.time() - t0))
+            outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
         return outputs, img_info
 
 
@@ -192,34 +163,29 @@ def image_demo(predictor, vis_folder, current_time, args):
         outputs, img_info = predictor.inference(img_path, timer)
         if outputs[0] is not None:
             online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
-            online_tlwhs = []
-            online_ids = []
-            online_scores = []
+            online_tlwhs, online_ids, online_scores = [], [], []
             for t in online_targets:
                 tlwh = t.tlwh
                 tid = t.track_id
-#################################################################################################
+                # Keep only the LLM-selected id if specified
                 if args.target_id != -1 and tid != args.target_id:
                     continue
-##################################################################################################
                 vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
                 if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
                     online_tlwhs.append(tlwh)
                     online_ids.append(tid)
                     online_scores.append(t.score)
-                    # save results
                     results.append(
                         f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                     )
             timer.toc()
             online_im = plot_tracking(
-                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time
+                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / max(1e-5, timer.average_time)
             )
         else:
             timer.toc()
             online_im = img_info['raw_img']
 
-        # result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
         if args.save_result:
             timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
             save_folder = osp.join(vis_folder, timestamp)
@@ -235,24 +201,41 @@ def image_demo(predictor, vis_folder, current_time, args):
 
     if args.save_result:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
-        with open(res_file, 'w') as f:
+        with open(res_file, 'w', encoding='utf-8') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
+
+
+def _extract_last_json(text: str, fallback=-1) -> int:
+    """
+    Extract the last JSON object in streaming text and return target_id.
+    Expected shape: {"target_id": <int>}
+    """
+    matches = re.findall(r"\{.*?\}", text, flags=re.DOTALL)
+    if not matches:
+        return fallback
+    for candidate in reversed(matches):
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict) and "target_id" in obj:
+                return int(obj.get("target_id", fallback))
+        except Exception:
+            continue
+    return fallback
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
     cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0 or fps > 120:
-        fps = args.fps
+    fps_meta = cap.get(cv2.CAP_PROP_FPS)
+    fps = fps_meta if (fps_meta and 0 < fps_meta <= 120) else args.fps
 
     timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
     save_folder = osp.join(vis_folder, timestamp)
     os.makedirs(save_folder, exist_ok=True)
 
-    base_name = osp.splitext(osp.basename(args.path))[0]
+    base_name = osp.splitext(osp.basename(args.path if args.demo == "video" else "webcam"))[0]
     avi_path = osp.join(save_folder, base_name + ".avi")
     mp4_path = osp.join(save_folder, base_name + ".mp4")
 
@@ -272,54 +255,47 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
 
         outputs, img_info = predictor.inference(frame, timer)
         if outputs[0] is not None:
-            online_targets = tracker.update(
-                outputs[0],
-                [img_info['height'], img_info['width']],
-                exp.test_size
-            )
+            online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
             online_tlwhs, online_ids = [], []
 
-            # ========== 第一幀 → 存所有 crop，呼叫 LLM ==========
+            # --- On first frame (and no pre-selected target), crop and call LLM to pick target_id ---
             if frame_id == 0 and args.target_id == -1:
                 os.makedirs("crops", exist_ok=True)
-                crop_files = []
                 for t in online_targets:
                     x1, y1, w, h = t.tlwh
                     x2, y2 = int(x1 + w), int(y1 + h)
                     crop = img_info['raw_img'][int(y1):int(y2), int(x1):int(x2)]
                     save_path = f"crops/i{t.track_id}_f{frame_id}.jpg"
                     cv2.imwrite(save_path, crop)
-                    crop_files.append(save_path)
 
-                import subprocess, json
-                raw = subprocess.check_output([
-                    "python", "LLM.py",
-                    "--crops", "crops",
-                    "--prompt", args.prompt
-                ], stderr=subprocess.STDOUT)
-
-                text = raw.decode("utf-8", errors="ignore")
-                print("=== LLM Raw Output ===")
-                print(text)
-
-                matches = re.findall(r"\{.*?\}", text, re.DOTALL)
-                if matches:
+                try:
+                    raw = subprocess.check_output(
+                        ["python", "LLM.py", "--crops", "crops", "--prompt", args.prompt],
+                        stderr=subprocess.STDOUT
+                    )
+                    text = raw.decode("utf-8", errors="ignore")
+                    print("=== LLM Raw Output ===")
+                    print(text)
+                    args.target_id = _extract_last_json(text, fallback=-1)
+                except subprocess.CalledProcessError as e:
+                    logger.warning("LLM.py returned non-zero exit, proceeding without target filter.")
                     try:
-                        result = json.loads(matches[-1])   # 只解析最後一個
-                        args.target_id = int(result.get("target_id", -1))
-                    except Exception as e:
-                        print(f"[ERROR] JSON parse 失敗: {e}")
+                        text = e.output.decode("utf-8", errors="ignore")
+                        print("=== LLM Raw Output (error path) ===")
+                        print(text)
+                        args.target_id = _extract_last_json(text, fallback=-1)
+                    except Exception:
                         args.target_id = -1
-                else:
+                except Exception as e:
+                    logger.warning(f"LLM invocation failed: {e}")
                     args.target_id = -1
-                logger.info(f"LLM 選出 target_id = {args.target_id}")
-            # =================================================
 
+                logger.info(f"LLM response target_id = {args.target_id}")
+
+            # --- Keep only the selected target_id if provided ---
             for t in online_targets:
                 tlwh = t.tlwh
                 tid = t.track_id
-
-                # 如果 target_id 已確定，過濾掉其他人
                 if args.target_id != -1 and tid != args.target_id:
                     continue
 
@@ -328,8 +304,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                     online_tlwhs.append(tlwh)
                     online_ids.append(tid)
                     results.append(
-                        f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},"
-                        f"{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
+                        f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                     )
 
             online_im = plot_tracking(
@@ -343,21 +318,39 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             vid_writer.write(online_im)
 
         frame_id += 1
+
     cap.release()
     vid_writer.release()
 
     if args.save_result:
-        # save txt results
+        # Save txt results
         res_file = osp.join(save_folder, f"{timestamp}.txt")
-        with open(res_file, 'w') as f:
+        with open(res_file, 'w', encoding='utf-8') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
 
-        # convert avi -> mp4
+        # Convert avi -> mp4 using ffmpeg
         logger.info(f"Converting {avi_path} to {mp4_path} using ffmpeg...")
-        os.system(f'ffmpeg -y -i "{avi_path}" -c:v libx264 -r {int(fps)} "{mp4_path}"')
-        logger.info(f"final video saved at {mp4_path}")
 
+        # Prefer PATH ffmpeg; else allow override via FFMPEG_BIN
+        ffmpeg_bin = shutil.which("ffmpeg") or os.environ.get("FFMPEG_BIN")
+        if not ffmpeg_bin or not osp.exists(ffmpeg_bin):
+            logger.warning(
+                "ffmpeg not found in PATH. Set env var FFMPEG_BIN to your ffmpeg.exe path, e.g.\n"
+                'set FFMPEG_BIN=D:\\CSProject\\ByteTrackLLM_HOTA\\ffmpeg-8.0-full_build\\bin\\ffmpeg.exe'
+            )
+            # Still try PATH name to keep old behavior; may fail silently on some shells
+            ffmpeg_bin = "ffmpeg"
+
+        try:
+            subprocess.run(
+                [ffmpeg_bin, "-y", "-i", avi_path, "-c:v", "libx264", "-r", str(int(fps)), mp4_path],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT
+            )
+        finally:
+            logger.info(f"final video saved at {mp4_path}")
 
 
 def main(exp, args):
@@ -389,13 +382,9 @@ def main(exp, args):
     model.eval()
 
     if not args.trt:
-        if args.ckpt is None:
-            ckpt_file = osp.join(output_dir, "best_ckpt.pth.tar")
-        else:
-            ckpt_file = args.ckpt
+        ckpt_file = args.ckpt if args.ckpt is not None else osp.join(output_dir, "best_ckpt.pth.tar")
         logger.info("loading checkpoint")
         ckpt = torch.load(ckpt_file, map_location="cpu")
-        # load the model state dict
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")
 
@@ -404,17 +393,15 @@ def main(exp, args):
         model = fuse_model(model)
 
     if args.fp16:
-        model = model.half()  # to FP16
+        model = model.half()
 
     if args.trt:
-        assert not args.fuse, "TensorRT model is not support model fusing!"
+        assert not args.fuse, "TensorRT model does not support fusing!"
         trt_file = osp.join(output_dir, "model_trt.pth")
-        assert osp.exists(
-            trt_file
-        ), "TensorRT model is not found!\n Run python3 tools/trt.py first!"
+        assert osp.exists(trt_file), "TensorRT model not found! Run tools/trt.py first."
         model.head.decode_in_inference = False
         decoder = model.head.decode_outputs
-        logger.info("Using TensorRT to inference")
+        logger.info("Using TensorRT for inference")
     else:
         trt_file = None
         decoder = None
@@ -423,12 +410,11 @@ def main(exp, args):
     current_time = time.localtime()
     if args.demo == "image":
         image_demo(predictor, vis_folder, current_time, args)
-    elif args.demo == "video" or args.demo == "webcam":
+    elif args.demo in ("video", "webcam"):
         imageflow_demo(predictor, vis_folder, current_time, args)
 
 
 if __name__ == "__main__":
     args = make_parser().parse_args()
     exp = get_exp(args.exp_file, args.name)
-
     main(exp, args)
