@@ -67,7 +67,9 @@ def make_parser():
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="MOT20 mode")
 
     # LLM target selection
-    parser.add_argument("--target_id", type=int, default=-1, help="keep only this track id; -1 = keep all")
+    parser.add_argument("--target_id", type=int, default=-1, help="(deprecated) single target mode")
+    parser.add_argument("--allow_ids", type=str, default="", help="comma-separated list of track ids to keep (multi target mode)")
+
     parser.add_argument("--prompt", type=str, default="track person with pink", help="prompt for the LLM")
 
     # Optional: explicit ffmpeg binary path via env var FFMPEG_BIN
@@ -296,8 +298,15 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             for t in online_targets:
                 tlwh = t.tlwh
                 tid = t.track_id
-                if args.target_id != -1 and tid != args.target_id:
-                    continue
+                # 支援 allow_ids 多目標
+                if args.allow_ids:
+                    allow_ids = set(int(x) for x in args.allow_ids.split(",") if x.strip())
+                    if tid not in allow_ids:
+                        continue
+                elif args.target_id != -1:
+                    if tid != args.target_id:
+                        continue
+
 
                 vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
                 if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
