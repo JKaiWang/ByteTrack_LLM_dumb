@@ -1,3 +1,4 @@
+# LLM_multi.py  (你也可以直接覆蓋原 LLM.py)
 import os, requests, base64, json, re, argparse, sys
 
 def encode_image(path):
@@ -23,7 +24,8 @@ files = sorted([
     if os.path.isfile(os.path.join(args.crops, f))
 ], key=lambda x: (parse_filename(os.path.basename(x))[1], parse_filename(os.path.basename(x))[0]))
 
-target_id = -1
+# ⭐ 由單一 target_id → 多個 target_ids
+positive_ids = set()
 
 for idx, f in enumerate(files, 1):
     fname = os.path.basename(f)
@@ -32,7 +34,10 @@ for idx, f in enumerate(files, 1):
 
     payload = {
         "model": "qwen2.5vl",
-        "prompt": f"{args.prompt}\nConfirm whether it meets the requirements. If yes, answer 'yes'. If not, answer 'no'.",
+        "prompt": (
+            f"{args.prompt}\n"
+            "Respond strictly with a single token: 'yes' if this crop matches, otherwise 'no'."
+        ),
         "images": [encode_image(f)]
     }
 
@@ -53,12 +58,15 @@ for idx, f in enumerate(files, 1):
             except:
                 continue
 
-    print(f"[DEBUG] LLM response: {result_text.strip()}")
+    result_text = result_text.strip().lower()
+    print(f"[DEBUG] LLM response: {result_text}")
 
-    if "yes" in result_text.lower():
-        target_id = person_id
-        print(f"[RESULT] Target ID: {target_id}")
-        break
+    # ⭐ 不再 break；改為全收集
+    if "yes" in result_text:
+        positive_ids.add(person_id)
+        print(result_text)
 
-print(json.dumps({"target_id": target_id}, ensure_ascii=False))
+# 輸出多個 ID
+out = {"target_ids": sorted(list(positive_ids))}
+print(json.dumps(out, ensure_ascii=False))
 sys.exit(0)
