@@ -4,13 +4,6 @@ This is a modified version of ByteTrack that integrates Large Language Model (LL
 
 #### ByteTrack is a simple, fast and strong multi-object tracker enhanced with LLM-based target identification.
 
-<p align="center"><img src="assets/sota.png" width="500"/></p>
-
-> Based on [**ByteTrack: Multi-Object Tracking by Associating Every Detection Box**](https://arxiv.org/abs/2110.06864)
-> 
-> Original authors: Yifu Zhang, Peize Sun, Yi Jiang, Dongdong Yu, Fucheng Weng, Zehuan Yuan, Ping Luo, Wenyu Liu, Xinggang Wang
-> 
-> *[arXiv 2110.06864](https://arxiv.org/abs/2110.06864)*
 
 ## Key Features
 
