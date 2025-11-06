@@ -25,6 +25,12 @@ llm_cmd = [
     "--threshold", str(args.similarity_threshold),
     "--qwen2-model", args.qwen2_model,
 ]
+# Pass optional bbox metadata if available
+for meta_name in ("llm_input.json", "bboxes.json"):
+    meta_path = os.path.join(ROOT_DIR, meta_name)
+    if os.path.exists(meta_path):
+        llm_cmd += ["--bbox_meta", meta_path]
+        break
 if args.device == "gpu":
     llm_cmd += ["--device", "cuda"]
 

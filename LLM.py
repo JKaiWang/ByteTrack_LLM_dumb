@@ -22,6 +22,9 @@ parser.add_argument("--qwen2-model", type=str, default="openai/clip-vit-large-pa
 parser.add_argument("--per_id_agg", type=str, choices=["max", "mean"], default="max", help="aggregate multiple crops per id: max or mean")
 # Optional batching for image crops
 parser.add_argument("--batch_size", type=int, default=32, help="batch size for image feature extraction")
+# Optional spatial metadata to inject global/location cues
+parser.add_argument("--bbox_meta", type=str, default="", help="optional JSON with boxes: {bboxes:[{id,bbox:[x1,y1,x2,y2]}], width, height}")
+parser.add_argument("--alpha", type=float, default=0.85, help="weight for visual cosine vs location prior: score=alpha*sim+(1-alpha)*loc")
 args = parser.parse_args()
 
 try:
@@ -139,14 +142,64 @@ try:
             s = float(crop_sim.max().item())
         sims_by_id.setdefault(pid, []).append(s)
 
-    # Aggregate per id and apply threshold
+    # Optional: compute simple location prior from bbox_meta and directional words in prompt
+    def _direction_prior_for_id(pid:int) -> float:
+        if not args.bbox_meta:
+            return 0.5
+        try:
+            with open(args.bbox_meta, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+        except Exception:
+            return 0.5
+        boxes = meta.get('bboxes') or meta.get('boxes') or []
+        if not boxes:
+            return 0.5
+        # infer W,H if not provided
+        W = meta.get('width'); H = meta.get('height')
+        if W is None or H is None:
+            xs2 = [b.get('bbox',[0,0,0,0])[2] for b in boxes if isinstance(b, dict)]
+            ys2 = [b.get('bbox',[0,0,0,0])[3] for b in boxes if isinstance(b, dict)]
+            W = max(xs2) if xs2 else 1.0
+            H = max(ys2) if ys2 else 1.0
+        # find box for id
+        bb = None
+        for b in boxes:
+            if int(b.get('id', -1)) == int(pid):
+                bb = b.get('bbox', None)
+                break
+        if not bb or len(bb) < 4:
+            return 0.5
+        x1,y1,x2,y2 = map(float, bb[:4])
+        cx = max(0.0, min(1.0, ((x1+x2)/2.0)/float(W)))
+        cy = max(0.0, min(1.0, ((y1+y2)/2.0)/float(H)))
+        # parse directions
+        p = args.prompt.lower()
+        scores = []
+        if 'right' in p:
+            scores.append(cx)            # closer to 1 on right
+        if 'left' in p:
+            scores.append(1.0 - cx)      # closer to 1 on left
+        if 'top' in p or 'upper' in p:
+            scores.append(1.0 - cy)      # top is small y
+        if 'bottom' in p or 'lower' in p:
+            scores.append(cy)
+        if 'center' in p or 'middle' in p:
+            scores.append(max(0.0, 1.0 - abs(cx-0.5)*2.0))
+        if not scores:
+            return 0.5
+        # combine by average
+        return max(0.0, min(1.0, sum(scores)/len(scores)))
+
+    # Aggregate per id and apply threshold (with optional spatial prior)
     positive_ids = []
     for pid, vals in sims_by_id.items():
         if not vals:
             continue
-        agg = max(vals) if args.per_id_agg == "max" else sum(vals)/len(vals)
-        print(f"[AGG] id={pid} {args.per_id_agg}={agg:.4f}")
-        if agg >= args.threshold:
+        agg_sim = max(vals) if args.per_id_agg == "max" else sum(vals)/len(vals)
+        loc_prior = _direction_prior_for_id(pid)
+        final_score = args.alpha * agg_sim + (1.0 - args.alpha) * loc_prior
+        print(f"[AGG] id={pid} sim={agg_sim:.4f} loc={loc_prior:.3f} final={final_score:.4f}")
+        if final_score >= args.threshold:
             positive_ids.append(pid)
 
 except Exception as e:
