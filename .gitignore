@@ -144,3 +144,8 @@ video/*
 pretrained/*
 pretrained/*
 .vscode
+
+# Running Benchmarks
+/datasets/__pycache__
+/models/__pycache__
+/log/
