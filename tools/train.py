@@ -83,6 +83,10 @@ def make_parser():
 
 @logger.catch
 def main(exp, args):
+    # Clear CUDA cache to prevent memory issues
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     if exp.seed is not None:
         random.seed(exp.seed)
         torch.manual_seed(exp.seed)
@@ -94,7 +98,8 @@ def main(exp, args):
         )
 
     # set environment variables for distributed training
-    cudnn.benchmark = True
+    # Disable benchmark to avoid cuDNN errors with dynamic input shapes
+    cudnn.benchmark = False
 
     trainer = Trainer(exp, args)
     trainer.train()
@@ -108,8 +113,16 @@ if __name__ == "__main__":
     if not args.experiment_name:
         args.experiment_name = exp.exp_name
 
-    num_gpu = torch.cuda.device_count() if args.devices is None else args.devices
-    assert num_gpu <= torch.cuda.device_count()
+    actual_gpu_count = torch.cuda.device_count()
+    if args.devices is None:
+        num_gpu = actual_gpu_count
+    else:
+        if args.devices > actual_gpu_count:
+            logger.warning(
+                f"Requested {args.devices} GPUs, but only {actual_gpu_count} are available. "
+                f"Using {actual_gpu_count} GPUs."
+            )
+        num_gpu = min(args.devices, actual_gpu_count)
 
     launch(
         main,

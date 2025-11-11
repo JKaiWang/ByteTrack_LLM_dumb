@@ -21,7 +21,8 @@ def select_targets(
     per_id_agg: str = "max",
     batch_size: int = 32,
     bbox_meta: Optional[str] = None,
-    alpha: float = 0.85
+    alpha: float = 0.85,
+    quiet: bool = False
 ) -> List[int]:
     """
     Select target IDs based on CLIP cosine similarity with prompt.
@@ -33,10 +34,8 @@ def select_targets(
         device: "cpu" or "cuda"
         qwen2_model: HuggingFace model ID for CLIP-like model
         per_id_agg: "max" or "mean" - how to aggregate multiple crops per id
-        batch_size: Batch size for image feature extraction
-        bbox_meta: Optional JSON path with bbox metadata
+        batch_size: Batch size for image feature extraction        bbox_meta: Optional JSON path with bbox metadata
         alpha: Weight for visual cosine vs location prior
-    
     Returns:
         List of target IDs that passed the threshold
     """
@@ -61,7 +60,7 @@ def select_targets(
 
         # Resolve device object early
         dev = torch.device("cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu")
-        if device == "cuda" and dev.type != "cuda":
+        if device == "cuda" and dev.type != "cuda" and not quiet:
             print("[WARN] CUDA requested but not available; falling back to CPU.")
 
         # Load model & processor
@@ -70,15 +69,18 @@ def select_targets(
             processor = AutoProcessor.from_pretrained(qwen2_model, trust_remote_code=True)
             chosen_id = qwen2_model
         except Exception as e:
-            print(f"[WARN] Failed to load {qwen2_model}: {e}")
+            if not quiet:
+                print(f"[WARN] Failed to load {qwen2_model}: {e}")
             fallback_id = "openai/clip-vit-large-patch14"
-            print(f"[INFO] Falling back to {fallback_id}")
+            if not quiet:
+                print(f"[INFO] Falling back to {fallback_id}")
             model = AutoModel.from_pretrained(fallback_id)
             processor = AutoProcessor.from_pretrained(fallback_id)
             chosen_id = fallback_id
         model = model.to(dev)
         model.eval()
-        print(f"[INFO] Using CLIP model={chosen_id} on {dev}")
+        if not quiet:
+            print(f"[INFO] Using CLIP model={chosen_id} on {dev}")
 
         # Text embeddings
         prompts = [p.strip() for p in prompt.split("||") if p.strip()]
@@ -111,7 +113,8 @@ def select_targets(
                     try:
                         imgs.append(Image.open(path).convert("RGB"))
                     except Exception as e:
-                        print(f"[ERROR] Failed to open {os.path.basename(path)}: {e}")
+                        if not quiet:
+                            print(f"[ERROR] Failed to open {os.path.basename(path)}: {e}")
                         imgs.append(None)
                 ok_items = [(j, im) for j, im in enumerate(imgs) if im is not None]
                 if not ok_items:
@@ -130,7 +133,8 @@ def select_targets(
                 valid_indices.extend([i + k for k in kept_idx])
 
         if not all_img_feats:
-            print("[WARN] No image features extracted.")
+            if not quiet:
+                print("[WARN] No image features extracted.")
             return []
 
         img_feats = torch.cat(all_img_feats, dim=0)
@@ -203,7 +207,8 @@ def select_targets(
             agg_sim = max(vals) if per_id_agg == "max" else sum(vals)/len(vals)
             loc_prior = _direction_prior_for_id(pid)
             final_score = alpha * agg_sim + (1.0 - alpha) * loc_prior
-            print(f"[AGG] id={pid} sim={agg_sim:.4f} loc={loc_prior:.3f} final={final_score:.4f}")
+            if not quiet:
+                print(f"[AGG] id={pid} sim={agg_sim:.4f} loc={loc_prior:.3f} final={final_score:.4f}")
             if final_score >= threshold:
                 positive_ids.append(pid)
 
@@ -242,7 +247,7 @@ if __name__ == "__main__":
         per_id_agg=args.per_id_agg,
         batch_size=args.batch_size,
         bbox_meta=args.bbox_meta if args.bbox_meta else None,
-        alpha=args.alpha
+        alpha=args.alpha,
     )
 
     out = {"target_ids": positive_ids}

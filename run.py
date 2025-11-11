@@ -1,11 +1,11 @@
 import subprocess
 import argparse
-import json
-import os, sys, re
-from subprocess import TimeoutExpired
+import os, sys
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+from LLM import select_targets
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--prompt", type=str, required=True)
@@ -17,60 +17,30 @@ parser.add_argument("--qwen2-model", type=str, default="openai/clip-vit-large-pa
 parser.add_argument("--llm-timeout", type=int, default=600, help="timeout (seconds) for LLM.py")
 args = parser.parse_args()
 
-# --- Step 1: Run LLM.py (Qwen2-CLIP cosine similarity) ---
-llm_cmd = [
-    sys.executable, "LLM.py",
-    "--crops", "crops",
-    "--prompt", args.prompt,
-    "--threshold", str(args.similarity_threshold),
-    "--qwen2-model", args.qwen2_model,
-]
-# Pass optional bbox metadata if available
+# --- Step 1: Run LLM target selection ---
+print("[INFO] Running LLM target selection via cosine similarity...")
+print(f"[INFO] prompt: {args.prompt}")
+
+# Find optional bbox metadata if available
+bbox_meta_path = None
 for meta_name in ("llm_input.json", "bboxes.json"):
     meta_path = os.path.join(ROOT_DIR, meta_name)
     if os.path.exists(meta_path):
-        llm_cmd += ["--bbox_meta", meta_path]
+        bbox_meta_path = meta_path
         break
-if args.device == "gpu":
-    llm_cmd += ["--device", "cuda"]
 
-print("[INFO] Launching LLM.py to select targets via cosine similarity...")
-print(f"[INFO] prompt: {args.prompt}")
+# Call select_targets directly
+device_str = "cuda" if args.device == "gpu" else "cpu"
+target_ids = select_targets(
+    crops_dir="crops",
+    prompt=args.prompt,
+    threshold=args.similarity_threshold,
+    device=device_str,
+    qwen2_model=args.qwen2_model,
+    bbox_meta=bbox_meta_path
+)
 
-try:
-    proc = subprocess.run(
-        llm_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=max(1, args.llm_timeout),
-    )
-    text = proc.stdout or ""
-except TimeoutExpired as e:
-    text = e.stdout.decode("utf-8", errors="ignore") if isinstance(e.stdout, (bytes, bytearray)) else (e.stdout or "")
-    print("[WARN] LLM.py timed out; proceeding without restricting target ids.")
-    proc = type("obj", (), {"returncode": -1})()  # sentinel
-
-print("=== LLM Raw Output ===")
-print(text)
-
-# Parse JSON robustly (take the last JSON object with key target_ids)
-target_ids = []
-try:
-    matches = re.findall(r"\{.*?\}", text, flags=re.DOTALL)
-    for cand in reversed(matches):
-        try:
-            data = json.loads(cand)
-            if isinstance(data.get("target_ids"), list):
-                target_ids = data["target_ids"]
-                break
-        except Exception:
-            continue
-except Exception as e:
-    print(f"[WARN] JSON parse failed: {e}")
-
-if getattr(proc, "returncode", 0) != 0:
-    print(f"[WARN] LLM.py returned non-zero exit code: {getattr(proc, 'returncode', 'N/A')}")
+print(f"[INFO] Selected target IDs: {target_ids}")
 
 # --- Step 2: Run demo_track.py and pass target_ids ---
 cmd = [

@@ -197,10 +197,6 @@ def image_demo(predictor, vis_folder, current_time, args):
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
 
-        ch = cv2.waitKey(0)
-        if ch == 27 or ch == ord("q") or ch == ord("Q"):
-            break
-
     if args.save_result:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
         with open(res_file, 'w', encoding='utf-8') as f:
