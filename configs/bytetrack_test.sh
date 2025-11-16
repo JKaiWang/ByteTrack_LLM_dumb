@@ -7,8 +7,8 @@
 
 python3 bytetrack_inference.py \
 image \
---exp_file exps/bytetrack/yolox_x_mix_det.py \
---ckpt exps/bytetrack/bytetrack_x_mot17.pth.tar \
+--exp_file exps/default/yolox_x.py \
+--ckpt pretrained/yolox_x.pth \
 --resume exps/bytetrack/checkpoint0052.pth \
 --fp16 \
 --fuse \
