@@ -7,8 +7,8 @@
 
 python3 bytetrack_inference.py \
 image \
--f exps/bytetrack/yolox_x_mix_det.py \
--c exps/bytetrack/bytetrack_x_mot17.pth.tar \
+--exp_file exps/bytetrack/yolox_x_mix_det.py \
+--ckpt exps/bytetrack/bytetrack_x_mot17.pth.tar \
 --resume exps/bytetrack/checkpoint0052.pth \
 --fp16 \
 --fuse \
@@ -16,7 +16,7 @@ image \
 --device gpu \
 --save_result \
 --rmot_path "./datasets/refer-kitti"  \
---filter_every_n_frames 15 
+--filter_every_n_frames 15
  #<- or testing refer-kitti v2
 #&> log.txt 
 
