@@ -21,6 +21,14 @@ def parse_filename(fname):
     return (-1, -1)
 
 
+def sort_key(x):
+    # fname: the outmost filename
+    fname = os.path.basename(x)
+    # match i<number>_f<number>: i12_f004
+    person_id, frame_id = parse_filename(fname)
+    return (frame_id, person_id)
+
+
 def select_targets(crops_dir, prompt, threshold=0.30, device="cpu", quiet=False):
     """Select target IDs from cropped images using LLM.
 
@@ -44,10 +52,7 @@ def select_targets(crops_dir, prompt, threshold=0.30, device="cpu", quiet=False)
             if os.path.isfile(os.path.join(crops_dir, f))
             and (f.endswith(".jpg") or f.endswith(".png"))
         ],
-        key=lambda x: (
-            parse_filename(os.path.basename(x))[1],
-            parse_filename(os.path.basename(x))[0],
-        ),
+        key=sort_key,  # sort frame_id first, then person_id
     )
 
     if not files:
@@ -64,7 +69,9 @@ def select_targets(crops_dir, prompt, threshold=0.30, device="cpu", quiet=False)
 
         payload = {
             "model": "qwen2.5vl",
-            "prompt": f"{prompt}\nConfirm whether it meets the requirements. If yes, answer 'yes'. If not, answer 'no'.",
+            "prompt": f"{prompt}\n \
+            Confirm whether it meets the requirements. \
+            If yes, answer 'yes'. If not, answer 'no'.",
             "images": [encode_image(f)],
         }
 
@@ -103,18 +110,18 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, required=True)
     args = parser.parse_args()
 
-    files = sorted(
-        [
-            os.path.abspath(os.path.join(args.crops, f))
-            for f in os.listdir(args.crops)
-            if os.path.isfile(os.path.join(args.crops, f))
-        ],
-        key=lambda x: (
-            parse_filename(os.path.basename(x))[1],
-            parse_filename(os.path.basename(x))[0],
-        ),
-    )
+    def get_sorted_files(crops_dir):
+        return sorted(
+            [
+                os.path.abspath(os.path.join(crops_dir, f))
+                for f in os.listdir(crops_dir)
+                if os.path.isfile(os.path.join(crops_dir, f))
+                and (f.endswith(".jpg") or f.endswith(".png"))
+            ],
+            key=sort_key,
+        )
 
+    files = get_sorted_files(args.crops)
     target_id = -1
 
     for idx, f in enumerate(files, 1):
@@ -146,7 +153,7 @@ if __name__ == "__main__":
                     data = json.loads(line.decode("utf-8"))
                     if "response" in data:
                         result_text += data["response"]
-                except:
+                except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
 
         print(f"[DEBUG] LLM response: {result_text.strip()}")

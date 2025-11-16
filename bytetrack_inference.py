@@ -219,17 +219,14 @@ class Detector(object):
             prompt=(self.sentence[0] if hasattr(self, "sentence") else args.prompt),
             threshold=getattr(args, "similarity_threshold", 0.30),
             device=device_str,
-            quiet=True,
+            quiet=False,
         )
-        logger.info(
-            f"Frame {frame_id}: LLM filtered, selected IDs: {selected_target_ids}"
-        )
-        import shutil
 
-        try:
-            shutil.rmtree(frame_crops_dir)
-        except Exception:
-            pass
+        # import shutil
+        # try:
+        #     shutil.rmtree(frame_crops_dir)
+        # except Exception:
+        #     pass
         return selected_target_ids
 
     def _process_targets_and_write(
@@ -252,7 +249,7 @@ class Detector(object):
 
             if (
                 use_llm_selection
-                and selected_target_ids
+                # and selected_target_ids
                 and tid not in selected_target_ids
             ):
                 continue
@@ -307,10 +304,27 @@ class Detector(object):
                 seq_h, seq_w, _ = ori_img.shape
 
             outputs, img_info = predictor.inference(img_path, timer)
+            
+            # outputs[0] is all the objects detected in this frame
             if outputs[0] is not None:
+                # MOT for the current frame
                 online_targets = tracker.update(
                     outputs[0], [img_info["height"], img_info["width"]], exp.test_size
                 )
+                
+                if frame_id == 195:
+                    # Write all frame 0 detections to a separate file
+                    frame_0_path = os.path.join(self.save_path, "frame_0_predict.txt")
+                    with open(frame_0_path, "w", encoding="utf-8") as f0:
+                        for t in online_targets:
+                            tlwh = t.tlwh
+                            tid = t.track_id
+                            line = (
+                                f"{frame_id+1},{int(tid)},{float(tlwh[0])},{float(tlwh[1])},"
+                                f"{float(tlwh[2])},{float(tlwh[3])},1,1,1\n"
+                            )
+                            f0.write(line)
+                    logger.info(f"Frame 0 detections written to {frame_0_path}")
 
                 should_filter = self._should_filter(frame_id, args)
 
@@ -318,6 +332,10 @@ class Detector(object):
                     frame_crops_dir = os.path.join(crops_dir, f"frame_{frame_id}")
                     selected_target_ids = self._run_llm_selection(
                         frame_crops_dir, frame_id, img_info, online_targets, args
+                    )
+
+                    logger.info(
+                        f"Frame {frame_id}: LLM filtered, prompt: {self.sentence[0]}, selected IDs: {selected_target_ids}"
                     )
 
                 online_tlwhs, online_ids, online_scores = (
@@ -458,6 +476,7 @@ def main(exp, args):
     output_dir = osp.join(exp.output_dir, args.experiment_name)
     os.makedirs(output_dir, exist_ok=True)
 
+    vis_folder = None
     if args.save_result:
         vis_folder = osp.join(output_dir, "track_vis")
         os.makedirs(vis_folder, exist_ok=True)

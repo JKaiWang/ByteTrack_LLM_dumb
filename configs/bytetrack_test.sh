@@ -14,9 +14,9 @@ image \
 --fuse \
 --output_dir exps/bytetrack \
 --device gpu \
---save_result \
 --rmot_path "./datasets/refer-kitti"  \
 --filter_every_n_frames 15
+# --save_result \
  #<- or testing refer-kitti v2
 #&> log.txt 
 
