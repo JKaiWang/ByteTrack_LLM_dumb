@@ -1,74 +1,159 @@
-# LLM_multi.py  (你也可以直接覆蓋原 LLM.py)
-import os, requests, base64, json, re, argparse, sys
+"""LLM helper script
 
-def encode_image(path):
+Given a directory of cropped person images, call a local LLM vision endpoint
+for each image and decide whether it matches the textual prompt.
+
+The script collects all person IDs that the LLM judges as a match and prints
+JSON like: {"target_ids": [1, 3, 5]}.
+"""
+
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+from typing import Iterable, List, Set, Tuple
+
+import requests
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+API_URL = "http://localhost:11434/api/generate"
+MODEL_NAME = "qwen2.5vl"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def encode_image(path: str) -> str:
+    """Read an image file and return its Base64-encoded string."""
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
-def parse_filename(fname):
-    match = re.match(r"i(\d+)_f(\d+)", fname)
+
+def parse_filename(filename: str) -> Tuple[int, int]:
+    """Extract (person_id, frame_id) from a filename.
+
+    Expected pattern: i{person_id}_f{frame_id}.*
+    Returns (-1, -1) if the filename does not match.
+    """
+
+    match = re.match(r"i(\d+)_f(\d+)", filename)
     if match:
         return int(match.group(1)), int(match.group(2))
-    return (-1, -1)
+    return -1, -1
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--crops", type=str, required=True)
-parser.add_argument("--prompt", type=str, required=True)
-args = parser.parse_args()
 
-API_URL = "http://localhost:11434/api/generate"
+def list_crop_files(crops_dir: str) -> List[str]:
+    """Return a list of absolute file paths in crops_dir sorted by (frame_id, person_id)."""
 
-files = sorted([
-    os.path.abspath(os.path.join(args.crops, f))
-    for f in os.listdir(args.crops)
-    if os.path.isfile(os.path.join(args.crops, f))
-], key=lambda x: (parse_filename(os.path.basename(x))[1], parse_filename(os.path.basename(x))[0]))
+    files = [
+        os.path.abspath(os.path.join(crops_dir, fname))
+        for fname in os.listdir(crops_dir)
+        if os.path.isfile(os.path.join(crops_dir, fname))
+    ]
 
-# ⭐ 由單一 target_id → 多個 target_ids（只做語義判斷，不處理位置）
-positive_ids = set()
+    # Sort by frame_id first, then person_id for deterministic order
+    files.sort(key=lambda path: (
+        parse_filename(os.path.basename(path))[1],
+        parse_filename(os.path.basename(path))[0],
+    ))
+    return files
 
-for idx, f in enumerate(files, 1):
-    fname = os.path.basename(f)
-    person_id, frame_id = parse_filename(fname)
-    print(f"[INFO] ({idx}/{len(files)}) Processing {fname}")
+
+def call_llm(image_path: str, prompt: str) -> str:
+    """Send a single image to the LLM endpoint and return the raw text response.
+
+    The LLM is instructed to answer 'yes' or 'no'. Any network errors result in
+    an empty string being returned.
+    """
 
     prompt_text = (
-        f"{args.prompt}\n"
-        "Respond strictly with a single token: 'yes' if this crop visually matches the described target (clothes, appearance, etc.), otherwise 'no'."
+        f"{prompt}\n"
+        "Respond strictly with a single token: 'yes' if this crop visually "
+        "matches the described target (clothes, appearance, etc.), otherwise "
+        "'no'."
     )
 
     payload = {
-        "model": "qwen2.5vl",
+        "model": MODEL_NAME,
         "prompt": prompt_text,
-        "images": [encode_image(f)]
+        "images": [encode_image(image_path)],
     }
 
     try:
-        resp = requests.post(API_URL, json=payload, stream=True)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[ERROR] LLM request failed: {e}")
-        continue
+        response = requests.post(API_URL, json=payload, stream=True)
+        response.raise_for_status()
+    except Exception as exc:  # broad, but we want to keep the script robust
+        print(f"[ERROR] LLM request failed for {os.path.basename(image_path)}: {exc}")
+        return ""
 
-    result_text = ""
-    for line in resp.iter_lines():
-        if line:
-            try:
-                data = json.loads(line.decode("utf-8"))
-                if "response" in data:
-                    result_text += data["response"]
-            except:
-                continue
+    result_chunks: List[str] = []
+    for line in response.iter_lines():
+        if not line:
+            continue
+        try:
+            data = json.loads(line.decode("utf-8"))
+        except json.JSONDecodeError:
+            # Skip malformed chunks
+            continue
+        if "response" in data:
+            result_chunks.append(data["response"])
 
-    result_text = result_text.strip().lower()
-    print(f"[DEBUG] LLM response: {result_text}")
+    result_text = "".join(result_chunks).strip().lower()
+    print(f"[DEBUG] LLM response for {os.path.basename(image_path)}: {result_text}")
+    return result_text
 
-    # ⭐ 不再 break；改為全收集
-    if "yes" in result_text:
-        positive_ids.add(person_id)
-        print(result_text)
 
-# 輸出多個 ID
-out = {"target_ids": sorted(list(positive_ids))}
-print(json.dumps(out, ensure_ascii=False))
-sys.exit(0)
+def collect_positive_ids(files: Iterable[str], prompt: str) -> Set[int]:
+    """Iterate over crop files, ask the LLM, and collect matching person IDs."""
+
+    positive_ids: Set[int] = set()
+    files_list = list(files)
+
+    for idx, file_path in enumerate(files_list, start=1):
+        filename = os.path.basename(file_path)
+        person_id, frame_id = parse_filename(filename)
+        print(f"[INFO] ({idx}/{len(files_list)}) Processing {filename}")
+
+        result_text = call_llm(file_path, prompt)
+
+        # Do not stop at the first positive; collect all matching IDs
+        if "yes" in result_text:
+            positive_ids.add(person_id)
+            print(f"[INFO] Marked as positive: person_id={person_id}, frame_id={frame_id}")
+
+    return positive_ids
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Call LLM on cropped images and collect matching IDs.")
+    parser.add_argument("--crops", type=str, required=True, help="Directory containing cropped person images.")
+    parser.add_argument("--prompt", type=str, required=True, help="Text description of the target person.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if not os.path.isdir(args.crops):
+        print(f"[ERROR] Crops directory does not exist: {args.crops}")
+        sys.exit(1)
+
+    files = list_crop_files(args.crops)
+    if not files:
+        print(f"[WARN] No crop files found in directory: {args.crops}")
+
+    positive_ids = collect_positive_ids(files, args.prompt)
+
+    # Output all positive IDs as JSON
+    output = {"target_ids": sorted(positive_ids)}
+    print(json.dumps(output, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
