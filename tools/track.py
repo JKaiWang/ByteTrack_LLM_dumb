@@ -107,6 +107,9 @@ def make_parser():
     parser.add_argument("--match_thresh", type=float, default=0.9, help="matching threshold for tracking")
     parser.add_argument("--min-box-area", type=float, default=100, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
+    # CLIP gating args
+    parser.add_argument("--text-prompt", type=str, default=None, help="Text prompt for CLIP filtering of new tracks (applied after frame 1)")
+    parser.add_argument("--clip-threshold", type=float, default=0.3, help="Cosine similarity threshold between CLIP image and text features")
     return parser
 
 

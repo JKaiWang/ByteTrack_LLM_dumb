@@ -72,6 +72,14 @@ def make_parser():
 
     parser.add_argument("--prompt", type=str, default="track person with pink", help="prompt for the LLM")
 
+    # Per-frame LLM: whenever a new track id appears, send its crop(s) to LLM.py
+    parser.add_argument("--per_frame_llm", action="store_true", help="for each new track id, call LLM.py on its crops to decide if it matches prompt")
+
+    # Online re-encode new detections and cosine-match against prompt
+    parser.add_argument("--online_reencode", action="store_true", help="when new tracks appear, encode crop and cosine-match vs prompt to decide allowing")
+    parser.add_argument("--similarity_threshold", type=float, default=0.30, help="cosine similarity threshold for online re-encode")
+    parser.add_argument("--qwen2_model", type=str, default="openai/clip-vit-large-patch14", help="HF model id for CLIP-like model used in online re-encode")
+
     # Optional: explicit ffmpeg binary path via env var FFMPEG_BIN
     return parser
 
@@ -169,6 +177,14 @@ def image_demo(predictor, vis_folder, current_time, args):
             for t in online_targets:
                 tlwh = t.tlwh
                 tid = t.track_id
+                # Online mode: filter by dynamic allowed set (seeded from allow_ids/target_id)
+                if args.online_reencode:
+                    if allowed_ids_set and tid not in allowed_ids_set:
+                        continue
+                # Online mode: filter by dynamic allowed set (seeded from allow_ids/target_id)
+                if args.online_reencode:
+                    if allowed_ids_set and tid not in allowed_ids_set:
+                        continue
                 # Keep only the LLM-selected id if specified
                 if args.target_id != -1 and tid != args.target_id:
                     continue
@@ -250,6 +266,88 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
     frame_id = 0
     results = []
 
+    # --- Online / LLM selection state ---
+    allowed_ids_set = set()
+    if args.allow_ids:
+        try:
+            allowed_ids_set.update(int(x) for x in args.allow_ids.split(",") if x.strip())
+        except Exception:
+            pass
+    if args.target_id != -1:
+        allowed_ids_set.add(int(args.target_id))
+
+    scorer = None
+    scored_ids = set()  # track IDs that have been evaluated once (for CLIP)
+    llm_scored_ids = set()  # track IDs already sent to LLM.py (per_frame_llm)
+    if args.online_reencode:
+        # Lazy import to avoid overhead when not used
+        try:
+            import torch  # noqa: F401
+            from transformers import AutoModel, AutoProcessor  # type: ignore
+        except Exception as e:
+            logger.warning(f"Failed to import transformers for online re-encode: {e}")
+            args.online_reencode = False
+        else:
+            # Resolve device from tracker arg
+            import torch
+            llm_device = torch.device("cuda" if (args.device == "gpu" and torch.cuda.is_available()) else "cpu")
+            if args.device == "gpu" and llm_device.type != "cuda":
+                logger.warning("CUDA requested for online re-encode but not available; using CPU")
+
+            # Load model/processor with fallback
+            try:
+                model = AutoModel.from_pretrained(args.qwen2_model, trust_remote_code=True)
+                processor = AutoProcessor.from_pretrained(args.qwen2_model, trust_remote_code=True)
+                chosen_id = args.qwen2_model
+            except Exception as e:
+                logger.warning(f"Failed to load {args.qwen2_model}: {e}")
+                fallback_id = "openai/clip-vit-large-patch14"
+                logger.info(f"Falling back to {fallback_id}")
+                model = AutoModel.from_pretrained(fallback_id)
+                processor = AutoProcessor.from_pretrained(fallback_id)
+                chosen_id = fallback_id
+            model = model.to(llm_device)
+            model.eval()
+            logger.info(f"Online re-encode using model={chosen_id} on {llm_device}")
+
+            # Prepare text embedding once (support multi-prompts split by '||')
+            from PIL import Image
+            with torch.no_grad():
+                prompts = [p.strip() for p in (args.prompt or "").split("||") if p.strip()]
+                if not prompts:
+                    prompts = [args.prompt]
+                text_inputs = processor(text=prompts, return_tensors="pt", padding=True)
+                text_inputs = {k: v.to(llm_device) for k, v in text_inputs.items()}
+                if hasattr(model, "get_text_features"):
+                    text_feat = model.get_text_features(**text_inputs)
+                else:
+                    outputs = model(**text_inputs)
+                    text_feat = outputs.text_embeds if hasattr(outputs, "text_embeds") else outputs[1]
+                text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+
+            def score_crop(bgr_crop) -> float:
+                # Convert BGR (cv2) to RGB PIL Image and score against prompt
+                if bgr_crop is None or bgr_crop.size == 0:
+                    return -1.0
+                try:
+                    rgb = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
+                except Exception:
+                    return -1.0
+                img = Image.fromarray(rgb)
+                with torch.no_grad():
+                    img_inputs = processor(images=[img], return_tensors="pt", padding=True)
+                    img_inputs = {k: v.to(llm_device) for k, v in img_inputs.items()}
+                    if hasattr(model, "get_image_features"):
+                        img_feat = model.get_image_features(**img_inputs)
+                    else:
+                        out = model(**img_inputs)
+                        img_feat = out.image_embeds if hasattr(out, "image_embeds") else out[0]
+                    img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+                    sim = (img_feat @ text_feat.T).max().item()
+                    return float(sim)
+
+            scorer = score_crop
+
     while True:
         ret_val, frame = cap.read()
         if not ret_val:
@@ -261,7 +359,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             online_tlwhs, online_ids = [], []
 
             # --- On first frame (and no pre-selected target), crop and call LLM to pick target_id ---
-            if frame_id == 0 and args.target_id == -1:
+            if (not args.per_frame_llm) and frame_id == 0 and args.target_id == -1:
                 os.makedirs("crops", exist_ok=True)
                 for t in online_targets:
                     x1, y1, w, h = t.tlwh
@@ -294,18 +392,190 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
 
                 logger.info(f"LLM response target_id = {args.target_id}")
 
-            # --- Keep only the selected target_id if provided ---
+            # --- Online evaluate new track IDs using CLIP cosine similarity ---
+            if args.online_reencode and scorer is not None:
+                H, W = img_info['raw_img'].shape[:2]
+                for t in online_targets:
+                    tid_eval = int(t.track_id)
+                    if tid_eval in allowed_ids_set or tid_eval in scored_ids:
+                        continue
+                    x1, y1, w, h = t.tlwh
+                    x1i, y1i, x2i, y2i = int(max(0, x1)), int(max(0, y1)), int(min(W, x1 + w)), int(min(H, y1 + h))
+                    if x2i <= x1i or y2i <= y1i:
+                        scored_ids.add(tid_eval)
+                        continue
+                    crop = img_info['raw_img'][y1i:y2i, x1i:x2i]
+                    sim = scorer(crop)
+                    if sim >= args.similarity_threshold:
+                        allowed_ids_set.add(tid_eval)
+                    scored_ids.add(tid_eval)
+
+            # --- Per-frame LLM: when a new track id appears, send its crop to LLM.py (LLM also sees coordinates) ---
+            if args.per_frame_llm:
+                H, W = img_info['raw_img'].shape[:2]
+                llm_crop_dir = "crops_llm"
+                os.makedirs(llm_crop_dir, exist_ok=True)
+
+                for t in online_targets:
+                    tid_eval = int(t.track_id)
+                    if tid_eval in llm_scored_ids:
+                        continue
+                    x1, y1, w, h = t.tlwh
+                    x1i, y1i = int(max(0, x1)), int(max(0, y1))
+                    x2i, y2i = int(min(W, x1 + w)), int(min(H, y1 + h))
+                    if x2i <= x1i or y2i <= y1i:
+                        llm_scored_ids.add(tid_eval)
+                        continue
+                    crop = img_info['raw_img'][y1i:y2i, x1i:x2i]
+                    # Clear old crops and save only this id's crop
+                    for f in os.listdir(llm_crop_dir):
+                        try:
+                            os.remove(os.path.join(llm_crop_dir, f))
+                        except Exception:
+                            pass
+                    save_path = os.path.join(llm_crop_dir, f"i{tid_eval}_f{frame_id}.jpg")
+                    cv2.imwrite(save_path, crop)
+
+                    # Compute crop center (both in pixels and normalized) and pass it to the LLM
+                    cx = max(0.0, min(float(W), x1 + w / 2.0))
+                    cy = max(0.0, min(float(H), y1 + h / 2.0))
+                    cx_norm = cx / max(1.0, float(W))
+                    cy_norm = cy / max(1.0, float(H))
+
+                    prompt_for_llm = (
+                        f"User request: {args.prompt}\n"
+                        "You are given a candidate person crop from a video frame.\n"
+                        f"The full frame size is width={W} pixels, height={H} pixels.\n"
+                        "The coordinate origin (0,0) is at the top-left corner, x increases to the right, y increases downward.\n"
+                        f"The center of this candidate in the full frame is at x={cx:.1f}, y={cy:.1f} (normalized: x={cx_norm:.3f}, y={cy_norm:.3f}).\n"
+                        "Use this SIMPLE rule for location: if normalized x >= 0.5 then the person is on the RIGHT side of the screen; if normalized x < 0.5 then the person is on the LEFT side of the screen.\n"
+                        "First, based on the image, decide if the person visually matches the described target (for example, wearing a black shirt).\n"
+                        "Second, apply the simple location rule above to check left/right using the normalized x value.\n"
+                        "Finally, respond strictly with a single token: 'yes' if BOTH the visual description and the required spatial/location constraint in the user request are satisfied, otherwise 'no'."
+                    )
+
+                    try:
+                        raw = subprocess.check_output(
+                            ["python", "LLM.py", "--crops", llm_crop_dir, "--prompt", prompt_for_llm],
+                            stderr=subprocess.STDOUT,
+                        )
+                        text = raw.decode("utf-8", errors="ignore")
+                        print("=== Per-frame LLM Raw Output ===")
+                        print(text)
+                        # 抓出最後一個 JSON，解析出 target_ids（LLM_multi 輸出）
+                        matches = re.findall(r"\{.*?\}", text, flags=re.DOTALL)
+                        if matches:
+                            try:
+                                obj = json.loads(matches[-1])
+                                tids = obj.get("target_ids", [])
+                                if isinstance(tids, int):
+                                    tids = [tids]
+                                tids = {int(x) for x in tids}
+                                if tid_eval in tids:
+                                    allowed_ids_set.add(tid_eval)
+                                    print(f"[PER_FRAME_LLM] allowed_ids_set = {sorted(allowed_ids_set)}")
+                            except Exception:
+                                pass
+                    except subprocess.CalledProcessError as e:
+                        try:
+                            text = e.output.decode("utf-8", errors="ignore")
+                            print("=== Per-frame LLM Raw Output (error path) ===")
+                            print(text)
+                            matches = re.findall(r"\{.*?\}", text, flags=re.DOTALL)
+                            if matches:
+                                try:
+                                    obj = json.loads(matches[-1])
+                                    tids = obj.get("target_ids", [])
+                                    if isinstance(tids, int):
+                                        tids = [tids]
+                                    tids = {int(x) for x in tids}
+                                    if tid_eval in tids:
+                                        allowed_ids_set.add(tid_eval)
+                                        print(f"[PER_FRAME_LLM] allowed_ids_set = {sorted(allowed_ids_set)}")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.warning(f"Per-frame LLM invocation failed for id {tid_eval}: {e}")
+                    finally:
+                        llm_scored_ids.add(tid_eval)
+
+            # --- Parse spatial words in the original prompt (for relative cases like leftmost/rightmost/middle) ---
+            prompt_l = (args.prompt or "").lower()
+            require_left = (
+                " in the left" in prompt_l or "on the left" in prompt_l or "left of the screen" in prompt_l or "左邊" in prompt_l
+            )
+            require_right = (
+                " in the right" in prompt_l or "on the right" in prompt_l or "right of the screen" in prompt_l or "右邊" in prompt_l
+            )
+            require_top = (
+                " at the top" in prompt_l or "at top" in prompt_l or "upper" in prompt_l or "上面" in prompt_l
+            )
+            require_bottom = (
+                " at the bottom" in prompt_l or "at bottom" in prompt_l or "lower" in prompt_l or "下面" in prompt_l
+            )
+            # 絕對位置 (left/right/top/bottom) 交給 LLM 依照座標決定；這裡只保留「相對位置」處理
+
+            # --- Relative position selection among allowed_ids (optional, for "leftmost/rightmost/middle" cases) ---
+            keep_tid_by_position = None
+            if args.per_frame_llm and allowed_ids_set:
+                # 只有在有 "leftmost" / "rightmost" / "middle one" / "中間那個" 這類「相對位置」描述時，才會挑單一人
+                has_rel_leftmost = ("leftmost" in prompt_l) or ("最左" in prompt_l)
+                has_rel_rightmost = ("rightmost" in prompt_l) or ("最右" in prompt_l)
+                has_rel_middle = ("middle one" in prompt_l) or ("the one in the middle" in prompt_l) or ("中間那個" in prompt_l)
+
+                if has_rel_leftmost or has_rel_rightmost or has_rel_middle:
+                    H, W = img_info['raw_img'].shape[:2]
+                    candidates = []  # (tid, x_center_norm)
+                    for t in online_targets:
+                        tid_pos = int(t.track_id)
+                        if tid_pos not in allowed_ids_set:
+                            continue
+                        x, y, w, h = t.tlwh
+                        x_center = x + w / 2.0
+                        x_center_norm = x_center / max(1.0, float(W))
+                        candidates.append((tid_pos, x_center_norm))
+
+                    if candidates:
+                        if has_rel_rightmost:
+                            keep_tid_by_position = max(candidates, key=lambda x: x[1])[0]
+                        elif has_rel_leftmost:
+                            keep_tid_by_position = min(candidates, key=lambda x: x[1])[0]
+                        elif has_rel_middle:
+                            keep_tid_by_position = min(candidates, key=lambda x: abs(x[1] - 0.5))[0]
+
+                        if keep_tid_by_position is not None:
+                            print(f"[REL_POS] keep_tid_by_position = {keep_tid_by_position}, allowed_ids_set = {sorted(allowed_ids_set)}")
+
+            # --- Keep only the selected ids ---
             for t in online_targets:
                 tlwh = t.tlwh
                 tid = t.track_id
-                # 支援 allow_ids 多目標
-                if args.allow_ids:
-                    allow_ids = set(int(x) for x in args.allow_ids.split(",") if x.strip())
-                    if tid not in allow_ids:
+
+                if args.per_frame_llm:
+                    # 開啟 per_frame_llm 時，先看 LLM 判斷；可允許多個同時存在
+                    if tid not in allowed_ids_set:
                         continue
-                elif args.target_id != -1:
-                    if tid != args.target_id:
+
+                    # 絕對位置條件改由 LLM 透過座標決定，這裡不再做第二層幾何過濾
+
+                    # 若 prompt 明確是「最左/最右/中間那個」這種相對位置，只保留幾何上被選中的那一個
+                    if keep_tid_by_position is not None and tid != keep_tid_by_position:
                         continue
+                elif args.online_reencode:
+                    # CLIP 相似度動態模式：只有在有已允許 ID 的時候才過濾
+                    if allowed_ids_set and tid not in allowed_ids_set:
+                        continue
+                else:
+                    # 傳統靜態模式：allow_ids 或單一 target_id
+                    if args.allow_ids:
+                        allow_ids = set(int(x) for x in args.allow_ids.split(",") if x.strip())
+                        if tid not in allow_ids:
+                            continue
+                    elif args.target_id != -1:
+                        if tid != args.target_id:
+                            continue
 
 
                 vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh

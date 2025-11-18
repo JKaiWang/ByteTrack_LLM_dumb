@@ -6,6 +6,16 @@ import copy
 import torch
 import torch.nn.functional as F
 
+# Optional deps for CLIP gating
+try:
+    import clip  # openai/CLIP
+    from PIL import Image
+    import cv2
+except Exception:
+    clip = None
+    Image = None
+    cv2 = None
+
 from .kalman_filter import KalmanFilter
 from yolox.tracker import matching
 from .basetrack import BaseTrack, TrackState
@@ -156,6 +166,26 @@ class BYTETracker(object):
         self.max_time_lost = self.buffer_size
         self.kalman_filter = KalmanFilter()
 
+        # CLIP gating setup
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.clip_enabled = False
+        self.clip_threshold = getattr(args, 'clip_threshold', 0.3)
+        self.text_prompt = getattr(args, 'text_prompt', None)
+        self.clip_model = None
+        self.clip_preprocess = None
+        self.text_feat = None
+        if self.text_prompt is not None and str(self.text_prompt).strip() != "" and clip is not None:
+            try:
+                self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+                with torch.no_grad():
+                    text_tokens = clip.tokenize([self.text_prompt]).to(self.device)
+                    text_features = self.clip_model.encode_text(text_tokens)
+                    self.text_feat = text_features / text_features.norm(dim=-1, keepdim=True)
+                self.clip_enabled = True
+            except Exception:
+                # Fallback: disable gating if CLIP failed to load
+                self.clip_enabled = False
+
     def update(self, output_results, img_info, img_size):
         self.frame_id += 1
         activated_starcks = []
@@ -173,6 +203,26 @@ class BYTETracker(object):
         img_h, img_w = img_info[0], img_info[1]
         scale = min(img_size[0] / float(img_h), img_size[1] / float(img_w))
         bboxes /= scale
+
+        # Try to load current frame image for CLIP gating if enabled and not first frame
+        frame_img = None
+        if self.clip_enabled and self.frame_id > 1 and Image is not None and cv2 is not None:
+            try:
+                file_name = img_info[4]
+                if isinstance(file_name, (list, tuple)):
+                    file_name = file_name[0]
+                # Try common dataset roots
+                candidate_paths = [
+                    osp.join('datasets', 'mot', 'train', file_name),
+                    osp.join('datasets', 'MOT20', 'train', file_name),
+                    file_name,
+                ]
+                for p in candidate_paths:
+                    if osp.exists(p):
+                        frame_img = cv2.imread(p)
+                        break
+            except Exception:
+                frame_img = None
 
         remain_inds = scores > self.args.track_thresh
         inds_low = scores > 0.1
@@ -265,6 +315,29 @@ class BYTETracker(object):
             track = detections[inew]
             if track.score < self.det_thresh:
                 continue
+            # CLIP gate new objects after the first frame
+            if self.clip_enabled and self.frame_id > 1 and frame_img is not None:
+                tlbr = track.tlbr
+                x0, y0, x1, y1 = [int(max(0, v)) for v in tlbr]
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                h, w = frame_img.shape[:2]
+                x0 = max(0, min(x0, w - 1))
+                x1 = max(0, min(x1, w))
+                y0 = max(0, min(y0, h - 1))
+                y1 = max(0, min(y1, h))
+                crop = frame_img[y0:y1, x0:x1]
+                if crop is None or crop.size == 0:
+                    continue
+                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(crop_rgb)
+                with torch.no_grad():
+                    clip_in = self.clip_preprocess(pil_img).unsqueeze(0).to(self.device)
+                    img_feat = self.clip_model.encode_image(clip_in)
+                    img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+                    sim = (img_feat @ self.text_feat.T).squeeze().item()
+                if sim < self.clip_threshold:
+                    continue
             track.activate(self.kalman_filter, self.frame_id)
             activated_starcks.append(track)
         """ Step 5: Update state"""
