@@ -144,3 +144,6 @@ video/*
 pretrained/*
 pretrained/*
 .vscode
+bboxes.json
+llm_cache.pt
+llm_input.json
