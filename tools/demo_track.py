@@ -75,11 +75,6 @@ def make_parser():
     # Per-frame LLM: whenever a new track id appears, send its crop(s) to LLM.py
     parser.add_argument("--per_frame_llm", action="store_true", help="for each new track id, call LLM.py on its crops to decide if it matches prompt")
 
-    # Online re-encode new detections and cosine-match against prompt
-    parser.add_argument("--online_reencode", action="store_true", help="when new tracks appear, encode crop and cosine-match vs prompt to decide allowing")
-    parser.add_argument("--similarity_threshold", type=float, default=0.30, help="cosine similarity threshold for online re-encode")
-    parser.add_argument("--qwen2_model", type=str, default="openai/clip-vit-large-patch14", help="HF model id for CLIP-like model used in online re-encode")
-
     # Optional: explicit ffmpeg binary path via env var FFMPEG_BIN
     return parser
 
@@ -276,77 +271,9 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
     if args.target_id != -1:
         allowed_ids_set.add(int(args.target_id))
 
-    scorer = None
+    scorer = None  # kept for compatibility; not used now that similarity is removed
     scored_ids = set()  # track IDs that have been evaluated once (for CLIP)
     llm_scored_ids = set()  # track IDs already sent to LLM.py (per_frame_llm)
-    if args.online_reencode:
-        # Lazy import to avoid overhead when not used
-        try:
-            import torch  # noqa: F401
-            from transformers import AutoModel, AutoProcessor  # type: ignore
-        except Exception as e:
-            logger.warning(f"Failed to import transformers for online re-encode: {e}")
-            args.online_reencode = False
-        else:
-            # Resolve device from tracker arg
-            import torch
-            llm_device = torch.device("cuda" if (args.device == "gpu" and torch.cuda.is_available()) else "cpu")
-            if args.device == "gpu" and llm_device.type != "cuda":
-                logger.warning("CUDA requested for online re-encode but not available; using CPU")
-
-            # Load model/processor with fallback
-            try:
-                model = AutoModel.from_pretrained(args.qwen2_model, trust_remote_code=True)
-                processor = AutoProcessor.from_pretrained(args.qwen2_model, trust_remote_code=True)
-                chosen_id = args.qwen2_model
-            except Exception as e:
-                logger.warning(f"Failed to load {args.qwen2_model}: {e}")
-                fallback_id = "openai/clip-vit-large-patch14"
-                logger.info(f"Falling back to {fallback_id}")
-                model = AutoModel.from_pretrained(fallback_id)
-                processor = AutoProcessor.from_pretrained(fallback_id)
-                chosen_id = fallback_id
-            model = model.to(llm_device)
-            model.eval()
-            logger.info(f"Online re-encode using model={chosen_id} on {llm_device}")
-
-            # Prepare text embedding once (support multi-prompts split by '||')
-            from PIL import Image
-            with torch.no_grad():
-                prompts = [p.strip() for p in (args.prompt or "").split("||") if p.strip()]
-                if not prompts:
-                    prompts = [args.prompt]
-                text_inputs = processor(text=prompts, return_tensors="pt", padding=True)
-                text_inputs = {k: v.to(llm_device) for k, v in text_inputs.items()}
-                if hasattr(model, "get_text_features"):
-                    text_feat = model.get_text_features(**text_inputs)
-                else:
-                    outputs = model(**text_inputs)
-                    text_feat = outputs.text_embeds if hasattr(outputs, "text_embeds") else outputs[1]
-                text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
-
-            def score_crop(bgr_crop) -> float:
-                # Convert BGR (cv2) to RGB PIL Image and score against prompt
-                if bgr_crop is None or bgr_crop.size == 0:
-                    return -1.0
-                try:
-                    rgb = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
-                except Exception:
-                    return -1.0
-                img = Image.fromarray(rgb)
-                with torch.no_grad():
-                    img_inputs = processor(images=[img], return_tensors="pt", padding=True)
-                    img_inputs = {k: v.to(llm_device) for k, v in img_inputs.items()}
-                    if hasattr(model, "get_image_features"):
-                        img_feat = model.get_image_features(**img_inputs)
-                    else:
-                        out = model(**img_inputs)
-                        img_feat = out.image_embeds if hasattr(out, "image_embeds") else out[0]
-                    img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
-                    sim = (img_feat @ text_feat.T).max().item()
-                    return float(sim)
-
-            scorer = score_crop
 
     while True:
         ret_val, frame = cap.read()
@@ -392,23 +319,6 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
 
                 logger.info(f"LLM response target_id = {args.target_id}")
 
-            # --- Online evaluate new track IDs using CLIP cosine similarity ---
-            if args.online_reencode and scorer is not None:
-                H, W = img_info['raw_img'].shape[:2]
-                for t in online_targets:
-                    tid_eval = int(t.track_id)
-                    if tid_eval in allowed_ids_set or tid_eval in scored_ids:
-                        continue
-                    x1, y1, w, h = t.tlwh
-                    x1i, y1i, x2i, y2i = int(max(0, x1)), int(max(0, y1)), int(min(W, x1 + w)), int(min(H, y1 + h))
-                    if x2i <= x1i or y2i <= y1i:
-                        scored_ids.add(tid_eval)
-                        continue
-                    crop = img_info['raw_img'][y1i:y2i, x1i:x2i]
-                    sim = scorer(crop)
-                    if sim >= args.similarity_threshold:
-                        allowed_ids_set.add(tid_eval)
-                    scored_ids.add(tid_eval)
 
             # --- Per-frame LLM: when a new track id appears, send its crop to LLM.py (LLM also sees coordinates) ---
             if args.per_frame_llm:
@@ -562,10 +472,6 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
 
                     # 若 prompt 明確是「最左/最右/中間那個」這種相對位置，只保留幾何上被選中的那一個
                     if keep_tid_by_position is not None and tid != keep_tid_by_position:
-                        continue
-                elif args.online_reencode:
-                    # CLIP 相似度動態模式：只有在有已允許 ID 的時候才過濾
-                    if allowed_ids_set and tid not in allowed_ids_set:
                         continue
                 else:
                     # 傳統靜態模式：allow_ids 或單一 target_id
